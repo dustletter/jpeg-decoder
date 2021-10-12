@@ -21,6 +21,13 @@ pub const MAX_COMPONENTS: usize = 4;
 mod lossless;
 use self::lossless::compute_image_lossless;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StopAfter {
+    Metadata,
+    Coefficients,
+    All,
+}
+
 static UNZIGZAG: [u8; 64] = [
      0,  1,  8, 16,  9,  2,  3, 10,
     17, 24, 32, 25, 18, 11,  4,  5,
@@ -58,7 +65,7 @@ impl PixelFormat {
 }
 
 /// Represents metadata of an image.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ImageInfo {
     /// The width of the image, in pixels.
     pub width: u16,
@@ -68,6 +75,24 @@ pub struct ImageInfo {
     pub pixel_format: PixelFormat,
     /// The coding process of the image.
     pub coding_process: CodingProcess,
+    /// The components of the image.
+    pub components: Vec<ComponentInfo>,
+}
+
+/// Represents metadata of an image component.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ComponentInfo {
+    pub horizontal_sampling_factor: u8,
+    pub vertical_sampling_factor: u8,
+
+    pub quantization_table_index: usize,
+
+    pub dct_scale: usize,
+
+    pub width: u16,
+    pub height: u16,
+    pub block_width: u16,
+    pub block_height: u16,
 }
 
 /// JPEG decoder
@@ -137,6 +162,16 @@ impl<R: Read> Decoder<R> {
                     height: frame.output_size.height,
                     pixel_format: pixel_format,
                     coding_process: frame.coding_process,
+                    components: frame.components.iter().map(|c| ComponentInfo {
+                        horizontal_sampling_factor: c.horizontal_sampling_factor,
+                        vertical_sampling_factor: c.vertical_sampling_factor,
+                        quantization_table_index: c.quantization_table_index,
+                        dct_scale: c.dct_scale,
+                        width: c.size.width,
+                        height: c.size.height,
+                        block_width: c.block_size.width,
+                        block_height: c.block_size.height,
+                    }).collect()
                 })
             },
             None => None,
@@ -187,7 +222,7 @@ impl<R: Read> Decoder<R> {
     ///
     /// If successful, the metadata can be obtained using the `info` method.
     pub fn read_info(&mut self) -> Result<()> {
-        self.decode_internal(true).map(|_| ())
+        self.decode_internal(StopAfter::Metadata).map(|_| ())
     }
 
     /// Configure the decoder to scale the image during decoding.
@@ -209,24 +244,34 @@ impl<R: Read> Decoder<R> {
 
     /// Decodes the image and returns the decoded pixels if successful.
     pub fn decode(&mut self) -> Result<Vec<u8>> {
-        self.decode_internal(false)
+        self.decode_internal(StopAfter::All)
     }
 
-    fn decode_internal(&mut self, stop_after_metadata: bool) -> Result<Vec<u8>> {
-        if stop_after_metadata && self.frame.is_some() {
-            // The metadata has already been read.
-            return Ok(Vec::new());
-        }
-        else if self.frame.is_none() && (read_u8(&mut self.reader)? != 0xFF || Marker::from_u8(read_u8(&mut self.reader)?) != Some(Marker::SOI)) {
-            return Err(Error::Format("first two bytes are not an SOI marker".to_owned()));
-        }
+    /// Decodes the image and returns the macroblock coefficients.
+    pub fn coefficients(&mut self) -> Result<Vec<&[i16]>> {
+        self.decode_internal(StopAfter::Coefficients)?;
+        Ok(self.coefficients.iter().map(|x| x.as_slice()).collect())
+    }
 
+    /// Decodes the image and mutably returns the macroblock coefficients. Changes to them will
+    /// be reflected when the image is fully decoded.
+    pub fn coefficients_mut(&mut self) -> Result<Vec<&mut [i16]>> {
+        self.decode_internal(StopAfter::Coefficients)?;
+        Ok(self.coefficients.iter_mut().map(|x| x.as_mut_slice()).collect())
+    }
+
+    /// Return stored macroblock coefficients, consuming the decoder.
+    pub fn into_coefficients(self) -> Vec<Vec<i16>> {
+        self.coefficients
+    }
+
+    fn decode_coefficients(&mut self, worker: &mut Option<PlatformWorker>,
+                           planes: &mut Vec<Vec<u8>>,
+                           planes_u16: &mut Vec<Vec<u16>>,
+                           stop_after: StopAfter) -> Result<()> {
         let mut previous_marker = Marker::SOI;
         let mut pending_marker = None;
-        let mut worker = None;
         let mut scans_processed = 0;
-        let mut planes = vec![Vec::<u8>::new(); self.frame.as_ref().map_or(0, |frame| frame.components.len())];
-        let mut planes_u16 = vec![Vec::<u16>::new(); self.frame.as_ref().map_or(0, |frame| frame.components.len())];
 
         loop {
             let marker = match pending_marker.take() {
@@ -269,12 +314,14 @@ impl<R: Read> Decoder<R> {
 
                     self.frame = Some(frame);
 
-                    if stop_after_metadata {
-                        return Ok(Vec::new());
+                    if stop_after == StopAfter::Metadata {
+                        return Ok(());
                     }
 
-                    planes = vec![Vec::new(); component_count];
-                    planes_u16 = vec![Vec::new(); component_count];
+                    // TODO: how should this be handled when reading coefficients in a separate step?
+                    //println!("clearing planes");
+                    *planes = vec![Vec::new(); component_count];
+                    *planes_u16 = vec![Vec::new(); component_count];
                 },
 
                 // Scan header
@@ -283,13 +330,13 @@ impl<R: Read> Decoder<R> {
                         return Err(Error::Format("scan encountered before frame".to_owned()));
                     }
                     if worker.is_none() {
-                        worker = Some(PlatformWorker::new()?);
+                        *worker = Some(PlatformWorker::new()?);
                     }
 
                     let frame = self.frame.clone().unwrap();
                     let scan = parse_sos(&mut self.reader, &frame)?;
 
-                    if frame.coding_process == CodingProcess::DctProgressive && self.coefficients.is_empty() {
+                    if (frame.coding_process == CodingProcess::DctProgressive || stop_after == StopAfter::Coefficients) && self.coefficients.is_empty() {
                         self.coefficients = frame.components.iter().map(|c| {
                             let block_count = c.block_size.width as usize * c.block_size.height as usize;
                             vec![0; block_count * 64]
@@ -335,7 +382,7 @@ impl<R: Read> Decoder<R> {
                             }
                         }
 
-                        let (marker, data) = self.decode_scan(&frame, &scan, worker.as_mut().unwrap(), &finished)?;
+                        let (marker, data) = self.decode_scan(&frame, &scan, worker.as_mut().unwrap(), &finished, stop_after)?;
 
                         if let Some(data) = data {
                             for (i, plane) in data.into_iter().enumerate().filter(|&(_, ref plane)| !plane.is_empty()) {
@@ -448,6 +495,32 @@ impl<R: Read> Decoder<R> {
 
             previous_marker = marker;
         }
+        Ok(())
+    }
+
+    fn decode_internal(&mut self, stop_after: StopAfter) -> Result<Vec<u8>> {
+        if stop_after == StopAfter::Metadata && self.frame.is_some() {
+            // The metadata has already been read.
+            return Ok(Vec::new());
+        } else if stop_after == StopAfter::Coefficients && !self.coefficients.is_empty() {
+            return Ok(Vec::new());
+        }
+        else if self.frame.is_none() && (read_u8(&mut self.reader)? != 0xFF || Marker::from_u8(read_u8(&mut self.reader)?) != Some(Marker::SOI)) {
+            return Err(Error::Format("first two bytes are not an SOI marker".to_owned()));
+        }
+
+        //println!("clearing planes?");
+        let mut planes = vec![Vec::new(); self.frame.as_ref().map_or(0, |frame| frame.components.len())];
+        let mut planes_u16 = vec![Vec::<u16>::new(); self.frame.as_ref().map_or(0, |frame| frame.components.len())];
+        let mut worker: Option<PlatformWorker> = None;
+        let coefficients_already_done = !self.coefficients.is_empty();
+
+        if !coefficients_already_done {
+            self.decode_coefficients(&mut worker, &mut planes, &mut planes_u16, stop_after)?;
+        }
+        if stop_after < StopAfter::All {
+            return Ok(Vec::new());
+        }
 
         if self.frame.is_none() {
             return Err(Error::Format("end of image encountered before frame".to_owned()));
@@ -456,10 +529,10 @@ impl<R: Read> Decoder<R> {
         let frame = self.frame.as_ref().unwrap();
 
         // If we're decoding a progressive jpeg and a component is unfinished, render what we've got
-        if frame.coding_process == CodingProcess::DctProgressive && self.coefficients.len() == frame.components.len() {
+        if (frame.coding_process == CodingProcess::DctProgressive || coefficients_already_done) && self.coefficients.len() == frame.components.len() {
             for (i, component) in frame.components.iter().enumerate() {
                 // Only dealing with unfinished components
-                if self.coefficients_finished[i] == !0 {
+                if !coefficients_already_done && self.coefficients_finished[i] == !0 {
                     continue;
                 }
 
@@ -494,10 +567,14 @@ impl<R: Read> Decoder<R> {
             }
         }
 
+        if stop_after == StopAfter::Coefficients {
+            return Ok(Vec::new());
+        }
+
         if frame.coding_process == CodingProcess::Lossless {
             compute_image_lossless(&frame, planes_u16)
         }
-        else{
+        else {
             compute_image(&frame.components, planes, frame.output_size, self.is_jfif, self.color_transform)
         }
     }
@@ -533,7 +610,8 @@ impl<R: Read> Decoder<R> {
                    frame: &FrameInfo,
                    scan: &ScanInfo,
                    worker: &mut PlatformWorker,
-                   finished: &[bool; MAX_COMPONENTS])
+                   finished: &[bool; MAX_COMPONENTS],
+                    stop_after: StopAfter)
                    -> Result<(Option<Marker>, Option<Vec<Vec<u8>>>)> {
         assert!(scan.component_indices.len() <= MAX_COMPONENTS);
 
@@ -562,7 +640,7 @@ impl<R: Read> Decoder<R> {
 
         // Prepare the worker thread for the work to come.
         for (i, component) in components.iter().enumerate() {
-            if finished[i] {
+            if finished[i] && stop_after == StopAfter::All {
                 let row_data = RowData {
                     index: i,
                     component: component.clone(),
@@ -583,7 +661,7 @@ impl<R: Read> Decoder<R> {
         let mut eob_run = 0;
         let mut mcu_row_coefficients = Vec::with_capacity(components.len());
 
-        if !is_progressive {
+        if !is_progressive && stop_after != StopAfter::Coefficients {
             for (_, component) in components.iter().enumerate().filter(|&(i, _)| finished[i]) {
                 let coefficients_per_mcu_row = component.block_size.width as usize * component.vertical_sampling_factor as usize * 64;
                 mcu_row_coefficients.push(vec![0i16; coefficients_per_mcu_row]);
@@ -662,10 +740,21 @@ impl<R: Read> Decoder<R> {
                                     mcu_y % component.vertical_sampling_factor as u16
                                 };
 
-                                let block_y = (mcu_batch_current_row * mcu_vertical_samples[i] + v_pos) as usize;
                                 let block_x = (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
-                                let block_offset = (block_y * component.block_size.width as usize + block_x) * 64;
-                                &mut mcu_row_coefficients[i][block_offset..block_offset + 64]
+
+                                if stop_after == StopAfter::Coefficients {
+                                    // TODO: I don't know if the difference between coefficients[i] (from the original
+                                    // code here) and coefficients[scan.component_indices[i]] (in the is_progressive
+                                    // block) is significant
+                                    let block_y = (mcu_y * mcu_vertical_samples[i] + v_pos) as usize;
+                                    let block_offset = (block_y * component.block_size.width as usize + block_x) * 64;
+                                    &mut self.coefficients[i][block_offset..block_offset + 64]
+                                } else {
+                                    let block_y = (mcu_batch_current_row * mcu_vertical_samples[i] + v_pos) as usize;
+                                    let block_offset = (block_y * component.block_size.width as usize + block_x) * 64;
+                                    &mut mcu_row_coefficients[i][block_offset..block_offset + 64]
+
+                                }
                             } else {
                                 &mut dummy_block[..]
                             };
@@ -709,7 +798,7 @@ impl<R: Read> Decoder<R> {
 
                     let coefficients_per_mcu_row = component.block_size.width as usize * component.vertical_sampling_factor as usize * 64;
 
-                    let row_coefficients = if is_progressive {
+                    let row_coefficients = if is_progressive || stop_after == StopAfter::Coefficients {
                         // Because non-interleaved streams will have multiple MCU rows concatenated together,
                         // the row for calculating the offset is different.
                         let worker_mcu_y = if is_interleaved {
@@ -725,7 +814,9 @@ impl<R: Read> Decoder<R> {
                         mem::replace(&mut mcu_row_coefficients[i], vec![0i16; coefficients_per_mcu_row])
                     };
 
-                    worker.append_row((i, row_coefficients))?;
+                    if stop_after == StopAfter::All {
+                        worker.append_row((i, row_coefficients))?;
+                    }
                 }
             }
         }
@@ -733,6 +824,10 @@ impl<R: Read> Decoder<R> {
         let mut marker = huffman.take_marker(&mut self.reader)?;
         while let Some(Marker::RST(_)) = marker {
             marker = self.read_marker().ok();
+        }
+
+        if stop_after == StopAfter::Coefficients {
+            return Ok((marker, None));
         }
 
         if finished.iter().any(|&c| c) {
@@ -964,6 +1059,7 @@ fn compute_image(components: &[Component],
                  is_jfif: bool,
                  color_transform: Option<AdobeColorTransform>) -> Result<Vec<u8>> {
     if data.is_empty() || data.iter().any(Vec::is_empty) {
+        //println!("data lengths: {:?}", data.iter().map(|x| x.len()).collect::<Vec<_>>());
         return Err(Error::Format("not all components have data".to_owned()));
     }
 
